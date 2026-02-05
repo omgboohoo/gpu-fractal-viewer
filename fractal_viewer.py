@@ -12,6 +12,8 @@ Two compute kernels: fast standard-double for normal zoom, double-double for dee
 Center coordinates tracked in Python Decimal for lossless accumulation.
 """
 
+import json
+import os
 import time
 import math
 from collections import deque
@@ -28,6 +30,7 @@ from pycuda.compiler import SourceModule
 getcontext().prec = 50
 
 DD_ZOOM_THRESHOLD = 1e13
+LOCATIONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "locations")
 
 PALETTE_NAMES = [
     "Classic",
@@ -448,6 +451,13 @@ class MandelbrotViewer:
         # UI buttons
         self.buttons = []
 
+        # Modal dialog state: None, "save", or "load"
+        self.modal = None
+        self.modal_text = ""
+        self.load_list = []
+        self.load_scroll = 0
+        self.load_hover = -1
+
         self._init_pygame()
         self._init_cuda()
         self._build_buttons()
@@ -532,6 +542,12 @@ class MandelbrotViewer:
         self._speed_label_y = y
         y += 20
 
+        # Save / Load
+        y += SECTION_GAP + 4
+        self.buttons.append((pygame.Rect(px, y, hw, BTN_H), "Save", "save"))
+        self.buttons.append((pygame.Rect(px + hw + BTN_GAP, y, hw, BTN_H), "Load", "load"))
+        y += BTN_H + BTN_GAP
+
         # Reset
         y += SECTION_GAP
         self.buttons.append((pygame.Rect(px, y, bw, BTN_H), "Reset View", "reset"))
@@ -579,6 +595,15 @@ class MandelbrotViewer:
             self.cycle_speed = max(0.25, round(self.cycle_speed - 0.25, 2))
         elif action == "speed_up":
             self.cycle_speed = min(8.0, round(self.cycle_speed + 0.25, 2))
+        elif action == "save":
+            self.modal = "save"
+            self.modal_text = ""
+        elif action == "load":
+            self._refresh_saved_list()
+            if self.load_list:
+                self.modal = "load"
+                self.load_scroll = 0
+                self.load_hover = -1
         elif action == "reset":
             self.center_x = Decimal("-0.5")
             self.center_y = Decimal("0.0")
@@ -603,6 +628,74 @@ class MandelbrotViewer:
         self.fractal_type = ftype
         self._auto_iter()
         self.needs_compute = True
+
+    # ── Save / Load locations ────────────────────────────────
+
+    def _refresh_saved_list(self):
+        """Scan the locations folder and build list of (display_name, filename)."""
+        os.makedirs(LOCATIONS_DIR, exist_ok=True)
+        self.load_list = []
+        for f in sorted(os.listdir(LOCATIONS_DIR)):
+            if not f.endswith(".json"):
+                continue
+            filepath = os.path.join(LOCATIONS_DIR, f)
+            try:
+                with open(filepath, "r") as fh:
+                    data = json.load(fh)
+                name = data.get("name", f.replace(".json", ""))
+            except (json.JSONDecodeError, OSError):
+                name = f.replace(".json", "")
+            self.load_list.append((name, f))
+
+    def _save_location(self, name):
+        """Save all current settings to a named JSON file."""
+        os.makedirs(LOCATIONS_DIR, exist_ok=True)
+        safe = "".join(c if c.isalnum() or c in " _-" else "_" for c in name).strip()
+        if not safe:
+            safe = "unnamed"
+        filename = f"{safe}.json"
+        data = {
+            "name": name,
+            "center_x": str(self.center_x),
+            "center_y": str(self.center_y),
+            "zoom": self.zoom,
+            "iter_offset": self.iter_offset,
+            "max_iter": self.max_iter,
+            "color_offset": self.color_offset,
+            "color_cycling": self.color_cycling,
+            "cycle_speed": self.cycle_speed,
+            "palette_id": self.palette_id,
+            "fractal_type": self.fractal_type,
+        }
+        filepath = os.path.join(LOCATIONS_DIR, filename)
+        with open(filepath, "w") as f:
+            json.dump(data, f, indent=2)
+
+    def _load_saved_location(self, filename):
+        """Load settings from a saved file."""
+        filepath = os.path.join(LOCATIONS_DIR, filename)
+        with open(filepath, "r") as f:
+            data = json.load(f)
+        self.center_x = Decimal(data["center_x"])
+        self.center_y = Decimal(data["center_y"])
+        self.zoom = data["zoom"]
+        self.iter_offset = data["iter_offset"]
+        self.color_offset = data.get("color_offset", 0.0)
+        self.color_cycling = data.get("color_cycling", False)
+        self.cycle_speed = data.get("cycle_speed", 1.0)
+        self.palette_id = data.get("palette_id", 0)
+        self.fractal_type = data.get("fractal_type", 0)
+        self._auto_iter()
+        self.needs_compute = True
+
+    def _delete_saved_location(self, filename):
+        """Delete a saved file and refresh the list."""
+        filepath = os.path.join(LOCATIONS_DIR, filename)
+        if os.path.exists(filepath):
+            os.remove(filepath)
+        self._refresh_saved_list()
+        if not self.load_list:
+            self.modal = None
 
     # ── Core helpers ──────────────────────────────────────────
 
@@ -770,6 +863,10 @@ class MandelbrotViewer:
         self.screen.blit(self.font.render(f"Speed: {self.cycle_speed:.2f}x", True, COL_TEXT),
                          (panel_x + PANEL_PAD, self._speed_label_y))
 
+        # Section: SAVE / LOAD
+        sec_y = self.buttons[11][0].y - 18
+        self.screen.blit(self.font_head.render("SAVE / LOAD", True, COL_HEADING), (panel_x + PANEL_PAD, sec_y))
+
         # Draw buttons
         for i, (rect, label, action) in enumerate(self.buttons):
             hovered = rect.collidepoint(mx, my)
@@ -788,14 +885,129 @@ class MandelbrotViewer:
         hint = self.font.render("[Tab] Hide", True, (120, 120, 140))
         self.screen.blit(hint, (panel_x + PANEL_PAD, self._panel_h - 20))
 
+    # ── Modal dialogs ──────────────────────────────────────────
+
+    def draw_modal(self):
+        if self.modal is None:
+            return
+
+        # Dim background
+        dim = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+        dim.fill((0, 0, 0, 140))
+        self.screen.blit(dim, (0, 0))
+
+        if self.modal == "save":
+            self._draw_save_dialog()
+        elif self.modal == "load":
+            self._draw_load_dialog()
+
+    def _draw_save_dialog(self):
+        dw, dh = 360, 120
+        dx = (self.width - dw) // 2
+        dy = (self.height - dh) // 2
+        box = pygame.Surface((dw, dh), pygame.SRCALPHA)
+        box.fill((30, 30, 45, 240))
+        self.screen.blit(box, (dx, dy))
+        pygame.draw.rect(self.screen, COL_ACCENT, (dx, dy, dw, dh), 1, border_radius=6)
+
+        self.screen.blit(self.font_head.render("Save Location", True, COL_ACCENT),
+                         (dx + 12, dy + 12))
+        self.screen.blit(self.font.render("Enter a name and press Enter:", True, COL_TEXT),
+                         (dx + 12, dy + 34))
+
+        # Text input box
+        input_rect = pygame.Rect(dx + 12, dy + 56, dw - 24, 28)
+        pygame.draw.rect(self.screen, (50, 50, 70), input_rect, border_radius=3)
+        pygame.draw.rect(self.screen, COL_ACCENT, input_rect, 1, border_radius=3)
+
+        display_text = self.modal_text
+        cursor = "|" if int(time.time() * 2) % 2 == 0 else ""
+        self.screen.blit(self.font.render(display_text + cursor, True, (255, 255, 255)),
+                         (input_rect.x + 6, input_rect.y + 7))
+
+        self.screen.blit(self.font.render("[Esc] Cancel", True, (120, 120, 140)),
+                         (dx + 12, dy + dh - 22))
+
+    def _draw_load_dialog(self):
+        ROW_H = 30
+        MAX_VISIBLE = 10
+        visible = min(len(self.load_list), MAX_VISIBLE)
+        dw = 400
+        dh = 52 + visible * ROW_H + 24
+        dx = (self.width - dw) // 2
+        dy = (self.height - dh) // 2
+
+        box = pygame.Surface((dw, dh), pygame.SRCALPHA)
+        box.fill((30, 30, 45, 240))
+        self.screen.blit(box, (dx, dy))
+        pygame.draw.rect(self.screen, COL_ACCENT, (dx, dy, dw, dh), 1, border_radius=6)
+
+        self.screen.blit(self.font_head.render("Load Location", True, COL_ACCENT),
+                         (dx + 12, dy + 12))
+
+        if not self.load_list:
+            self.screen.blit(self.font.render("No saved locations.", True, COL_TEXT),
+                             (dx + 12, dy + 40))
+        else:
+            mx, my = pygame.mouse.get_pos()
+            self.load_hover = -1
+            list_y = dy + 40
+            self.load_scroll = max(0, min(self.load_scroll, len(self.load_list) - MAX_VISIBLE))
+
+            for i in range(visible):
+                idx = i + self.load_scroll
+                if idx >= len(self.load_list):
+                    break
+                name, filename = self.load_list[idx]
+                row_rect = pygame.Rect(dx + 8, list_y + i * ROW_H, dw - 56, ROW_H - 2)
+                del_rect = pygame.Rect(dx + dw - 44, list_y + i * ROW_H, 36, ROW_H - 2)
+
+                # Hover highlight for row
+                if row_rect.collidepoint(mx, my):
+                    self.load_hover = idx
+                    pygame.draw.rect(self.screen, (60, 60, 90), row_rect, border_radius=3)
+                else:
+                    pygame.draw.rect(self.screen, (40, 40, 58), row_rect, border_radius=3)
+
+                display = name if len(name) <= 34 else name[:32] + ".."
+                self.screen.blit(self.font.render(display, True, COL_TEXT),
+                                 (row_rect.x + 8, row_rect.y + 7))
+
+                # Delete button
+                del_hover = del_rect.collidepoint(mx, my)
+                del_col = (140, 60, 60) if del_hover else (80, 50, 50)
+                pygame.draw.rect(self.screen, del_col, del_rect, border_radius=3)
+                xtxt = self.font.render("X", True, (200, 100, 100))
+                self.screen.blit(xtxt, (del_rect.x + (del_rect.w - xtxt.get_width()) // 2,
+                                        del_rect.y + (del_rect.h - xtxt.get_height()) // 2))
+
+            # Scroll hint
+            if len(self.load_list) > MAX_VISIBLE:
+                hint = f"Scroll: {self.load_scroll + 1}-{self.load_scroll + visible} of {len(self.load_list)}"
+                self.screen.blit(self.font.render(hint, True, (120, 120, 140)),
+                                 (dx + 12, dy + dh - 22))
+
+        esc_x = dx + dw - self.font.size("[Esc] Cancel")[0] - 12
+        self.screen.blit(self.font.render("[Esc] Cancel", True, (120, 120, 140)),
+                         (esc_x, dy + dh - 22))
+
     # ── Event handling ────────────────────────────────────────
 
     def handle_events(self):
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
+                continue
 
-            elif event.type == pygame.KEYDOWN:
+            # Route to modal handlers when a dialog is open
+            if self.modal == "save":
+                self._handle_save_modal_event(event)
+                continue
+            if self.modal == "load":
+                self._handle_load_modal_event(event)
+                continue
+
+            if event.type == pygame.KEYDOWN:
                 self._handle_keydown(event)
 
             elif event.type == pygame.MOUSEBUTTONDOWN:
@@ -820,6 +1032,59 @@ class MandelbrotViewer:
 
             elif event.type == pygame.VIDEORESIZE:
                 self._handle_resize(event.w, event.h)
+
+    def _handle_save_modal_event(self, event):
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                self.modal = None
+            elif event.key == pygame.K_RETURN:
+                name = self.modal_text.strip()
+                if name:
+                    self._save_location(name)
+                self.modal = None
+            elif event.key == pygame.K_BACKSPACE:
+                self.modal_text = self.modal_text[:-1]
+            else:
+                ch = event.unicode
+                if ch and ch.isprintable() and len(self.modal_text) < 40:
+                    self.modal_text += ch
+
+    def _handle_load_modal_event(self, event):
+        ROW_H = 30
+        MAX_VISIBLE = 10
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                self.modal = None
+        elif event.type == pygame.MOUSEWHEEL:
+            self.load_scroll -= event.y
+            self.load_scroll = max(0, min(self.load_scroll,
+                                          len(self.load_list) - MAX_VISIBLE))
+        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if not self.load_list:
+                return
+            visible = min(len(self.load_list), MAX_VISIBLE)
+            dw = 400
+            dh = 52 + visible * ROW_H + 24
+            dx = (self.width - dw) // 2
+            dy = (self.height - dh) // 2
+            list_y = dy + 40
+            mx, my = event.pos
+
+            for i in range(visible):
+                idx = i + self.load_scroll
+                if idx >= len(self.load_list):
+                    break
+                row_rect = pygame.Rect(dx + 8, list_y + i * ROW_H, dw - 56, ROW_H - 2)
+                del_rect = pygame.Rect(dx + dw - 44, list_y + i * ROW_H, 36, ROW_H - 2)
+                if del_rect.collidepoint(mx, my):
+                    _name, filename = self.load_list[idx]
+                    self._delete_saved_location(filename)
+                    return
+                if row_rect.collidepoint(mx, my):
+                    _name, filename = self.load_list[idx]
+                    self._load_saved_location(filename)
+                    self.modal = None
+                    return
 
     def _handle_panel_click(self, pos):
         if not self.panel_visible:
@@ -859,6 +1124,15 @@ class MandelbrotViewer:
             self._do_action("fractal_prev")
         elif event.key == pygame.K_RIGHTBRACKET:
             self._do_action("fractal_next")
+        elif event.key == pygame.K_s:
+            self.modal = "save"
+            self.modal_text = ""
+        elif event.key == pygame.K_l:
+            self._refresh_saved_list()
+            if self.load_list:
+                self.modal = "load"
+                self.load_scroll = 0
+                self.load_hover = -1
         elif event.key == pygame.K_r:
             self._do_action("reset")
 
@@ -924,6 +1198,7 @@ class MandelbrotViewer:
                 self.screen.blit(self.surface, (0, 0))
                 self.draw_overlay()
                 self.draw_panel()
+                self.draw_modal()
                 pygame.display.flip()
 
                 self._update_fps()
