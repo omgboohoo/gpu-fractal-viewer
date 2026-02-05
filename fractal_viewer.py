@@ -67,8 +67,8 @@ PRESET_LOCATIONS = [
     ("Double Spiral", "-0.7269", "0.1889", 5000.0, 100, 0),
     ("Elephant Valley", "0.2549", "0.0005", 5000.0, 100, 0),
     ("Triple Spiral", "-0.0883", "0.6549", 10000.0, 150, 0),
-    ("Burning Ship", "-0.45", "-0.575", 15.0, 50, 1),
-    ("Tricorn", "0.0", "0.0", 1.5, 0, 2),
+    ("Burning Ship", "-0.5", "-0.5", 1.0, 100, 1),
+    ("Tricorn", "-0.3", "0.0", 1.0, 50, 2),
     ("Julia: Dragon", "0.0", "0.0", 1.2, 50, 3),
     ("Julia: Dendrite", "0.0", "0.0", 1.2, 50, 4),
     ("Julia: Spiral", "0.0", "0.0", 1.2, 50, 5),
@@ -128,17 +128,12 @@ __global__ void compute_fast(
     }
 
     while (zx2 + zy2 <= 65536.0 && iter < max_iter) {
-        if (fractal_type == 0) { // Standard Mandelbrot z^2 + c
-            zy = 2.0 * zx * zy + cy;
-            zx = zx2 - zy2 + cx;
-        } else if (fractal_type == 1) { // Burning Ship
-            zy = 2.0 * fabs(zx) * fabs(zy) + cy;
-            zx = zx2 - zy2 + cx;
-        } else if (fractal_type == 2) { // Tricorn (Mandelbar conjugate)
+        if (fractal_type == 1) { // Burning Ship: abs BEFORE squaring
+            double ax = fabs(zx), ay = fabs(zy);
+            zy = 2.0 * ax * ay + cy;
+            zx = ax * ax - ay * ay + cx;
+        } else if (fractal_type == 2) { // Tricorn: conjugate z
             zy = -2.0 * zx * zy + cy;
-            zx = zx2 - zy2 + cx;
-        } else if (fractal_type >= 3 && fractal_type <= 7) { // Julia sets
-            zy = 2.0 * zx * zy + cy;
             zx = zx2 - zy2 + cx;
         } else if (fractal_type == 8) { // Multibrot z^3
             temp = zx * (zx2 - 3.0 * zy2) + cx;
@@ -154,6 +149,9 @@ __global__ void compute_fast(
             zx_old = zx;
             zy_old = zy;
             zx = temp;
+        } else { // Mandelbrot (0) and all Julia sets (3-7)
+            zy = 2.0 * zx * zy + cy;
+            zx = zx2 - zy2 + cx;
         }
 
         zx2 = zx * zx;
@@ -258,13 +256,21 @@ __global__ void compute_deep(
     }
 
     while (iter < max_iter) {
-        dd_mul(zx_hi, zx_lo, zx_hi, zx_lo, &zx2_hi, &zx2_lo);
-        dd_mul(zy_hi, zy_lo, zy_hi, zy_lo, &zy2_hi, &zy2_lo);
+        // Burning Ship: take abs of z components before squaring
+        double ax_hi = zx_hi, ax_lo = zx_lo;
+        double ay_hi = zy_hi, ay_lo = zy_lo;
+        if (fractal_type == 1) {
+            if (ax_hi < 0.0) { ax_hi = -ax_hi; ax_lo = -ax_lo; }
+            if (ay_hi < 0.0) { ay_hi = -ay_hi; ay_lo = -ay_lo; }
+        }
+
+        dd_mul(ax_hi, ax_lo, ax_hi, ax_lo, &zx2_hi, &zx2_lo);
+        dd_mul(ay_hi, ay_lo, ay_hi, ay_lo, &zy2_hi, &zy2_lo);
 
         if (zx2_hi + zy2_hi > 65536.0) break;
 
         double txy_hi, txy_lo;
-        dd_mul(zx_hi, zx_lo, zy_hi, zy_lo, &txy_hi, &txy_lo);
+        dd_mul(ax_hi, ax_lo, ay_hi, ay_lo, &txy_hi, &txy_lo);
         dd_add(txy_hi, txy_lo, txy_hi, txy_lo, &zy_hi, &zy_lo);
 
         if (fractal_type == 2) { // Tricorn (conjugate)
