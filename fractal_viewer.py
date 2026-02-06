@@ -31,6 +31,7 @@ getcontext().prec = 50
 
 DD_ZOOM_THRESHOLD = 1e13
 LOCATIONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "locations")
+IMAGES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images")
 
 PALETTE_NAMES = [
     "Classic",
@@ -58,6 +59,30 @@ FRACTAL_TYPES = [
     ("Multibrot z^4", 9),
     ("Phoenix", 10),
 ]
+
+# Aspect ratios: (name, width_ratio, height_ratio)
+ASPECT_RATIOS = [
+    ("16:9", 16, 9),
+    ("21:9", 21, 9),
+    ("32:9", 32, 9),
+    ("48:9", 48, 9),
+    ("4:3", 4, 3),
+    ("1:1", 1, 1),
+    ("3:2", 3, 2),
+    ("16:10", 16, 10),
+]
+
+# Resolution presets keyed by aspect name
+RESOLUTION_PRESETS = {
+    "16:9":  [(1920, 1080), (2560, 1440), (3840, 2160), (7680, 4320)],
+    "21:9":  [(2560, 1080), (3440, 1440), (5120, 2160)],
+    "32:9":  [(3840, 1080), (5120, 1440), (7680, 2160)],
+    "48:9":  [(5760, 1080), (7680, 1440), (11520, 2160)],
+    "4:3":   [(1600, 1200), (2048, 1536), (3200, 2400)],
+    "1:1":   [(1080, 1080), (2160, 2160), (4320, 4320)],
+    "3:2":   [(2160, 1440), (3240, 2160), (4320, 2880)],
+    "16:10": [(1920, 1200), (2560, 1600), (3840, 2400)],
+}
 
 # Default view for each fractal type: (center_x, center_y, zoom, iter_offset)
 FRACTAL_DEFAULTS = {
@@ -460,6 +485,8 @@ class MandelbrotViewer:
         self.cycle_speed = 1.0
         self.palette_id = 0
         self.current_preset = 0
+        self.aspect_id = 0
+        self.save_res_idx = 0
 
         # Interaction state
         self.dragging = False
@@ -507,6 +534,24 @@ class MandelbrotViewer:
         self._init_cuda()
         self._build_buttons()
 
+    def _update_render_area(self):
+        """Calculate render area dimensions to fit the current aspect ratio within the window."""
+        _name, wr, hr = ASPECT_RATIOS[self.aspect_id]
+        target_aspect = wr / hr
+        window_aspect = self.width / self.height
+        if window_aspect > target_aspect:
+            # Window wider than target — pillarbox
+            self.render_h = self.height
+            self.render_w = int(self.height * target_aspect)
+        else:
+            # Window taller than target — letterbox
+            self.render_w = self.width
+            self.render_h = int(self.width / target_aspect)
+        self.render_w = max(self.render_w, 64)
+        self.render_h = max(self.render_h, 64)
+        self.render_x = (self.width - self.render_w) // 2
+        self.render_y = (self.height - self.render_h) // 2
+
     def _init_pygame(self):
         pygame.init()
         self.screen = pygame.display.set_mode(
@@ -516,7 +561,8 @@ class MandelbrotViewer:
         self.clock = pygame.time.Clock()
         self.font = pygame.font.SysFont("monospace", 13)
         self.font_head = pygame.font.SysFont("monospace", 13, bold=True)
-        self.surface = pygame.Surface((self.width, self.height))
+        self._update_render_area()
+        self.surface = pygame.Surface((self.render_w, self.render_h))
 
     def _init_cuda(self):
         self.module = SourceModule(CUDA_KERNEL)
@@ -526,10 +572,10 @@ class MandelbrotViewer:
         self._alloc_gpu_buffers()
 
     def _alloc_gpu_buffers(self):
-        self.host_buf = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+        self.host_buf = np.zeros((self.render_h, self.render_w, 3), dtype=np.uint8)
         self.gpu_rgb = cuda.mem_alloc(self.host_buf.nbytes)
         # Float buffer for cached smooth iteration counts
-        iter_bytes = self.width * self.height * np.dtype(np.float32).itemsize
+        iter_bytes = self.render_w * self.render_h * np.dtype(np.float32).itemsize
         self.gpu_iter = cuda.mem_alloc(iter_bytes)
 
     # ── UI button layout ──────────────────────────────────────
@@ -560,8 +606,8 @@ class MandelbrotViewer:
 
         # Iterations
         y += SECTION_GAP + 4
-        self.buttons.append((pygame.Rect(px, y, hw, BTN_H), "-50", "iter_down"))
-        self.buttons.append((pygame.Rect(px + hw + BTN_GAP, y, hw, BTN_H), "+50", "iter_up"))
+        self.buttons.append((pygame.Rect(px, y, hw, BTN_H), "-100", "iter_down"))
+        self.buttons.append((pygame.Rect(px + hw + BTN_GAP, y, hw, BTN_H), "+100", "iter_up"))
         y += BTN_H + BTN_GAP
         self._iter_label_y = y
         y += 18
@@ -572,6 +618,14 @@ class MandelbrotViewer:
         self.buttons.append((pygame.Rect(px + hw + BTN_GAP, y, hw, BTN_H), ">", "palette_next"))
         y += BTN_H + BTN_GAP
         self._palette_label_y = y
+        y += 18
+
+        # Aspect Ratio
+        y += SECTION_GAP + 4
+        self.buttons.append((pygame.Rect(px, y, hw, BTN_H), "<", "aspect_prev"))
+        self.buttons.append((pygame.Rect(px + hw + BTN_GAP, y, hw, BTN_H), ">", "aspect_next"))
+        y += BTN_H + BTN_GAP
+        self._aspect_label_y = y
         y += 18
 
         # Color Cycle
@@ -592,11 +646,13 @@ class MandelbrotViewer:
         self.buttons.append((pygame.Rect(px, y, hw, BTN_H), "Save", "save"))
         self.buttons.append((pygame.Rect(px + hw + BTN_GAP, y, hw, BTN_H), "Load", "load"))
         y += BTN_H + BTN_GAP
+        self.buttons.append((pygame.Rect(px, y, bw, BTN_H), "Save Image", "save_image"))
+        y += BTN_H + BTN_GAP
 
         # Reset
         y += SECTION_GAP
         self.buttons.append((pygame.Rect(px, y, bw, BTN_H), "Reset View", "reset"))
-        y += BTN_H + BTN_GAP
+        y += BTN_H + BTN_GAP + 20
 
         self._panel_h = y + PANEL_PAD
 
@@ -621,11 +677,11 @@ class MandelbrotViewer:
             self.current_preset = (self.current_preset + 1) % len(PRESET_LOCATIONS)
             self._load_preset(self.current_preset)
         elif action == "iter_up":
-            self.iter_offset += 50
+            self.iter_offset += 100
             self._auto_iter()
             self.needs_compute = True
         elif action == "iter_down":
-            self.iter_offset -= 50
+            self.iter_offset -= 100
             self._auto_iter()
             self.needs_compute = True
         elif action == "palette_prev":
@@ -634,6 +690,12 @@ class MandelbrotViewer:
         elif action == "palette_next":
             self.palette_id = (self.palette_id + 1) % len(PALETTE_NAMES)
             self.needs_colorize = True
+        elif action == "aspect_prev":
+            self.aspect_id = (self.aspect_id - 1) % len(ASPECT_RATIOS)
+            self._apply_aspect_ratio()
+        elif action == "aspect_next":
+            self.aspect_id = (self.aspect_id + 1) % len(ASPECT_RATIOS)
+            self._apply_aspect_ratio()
         elif action == "cycle_toggle":
             self.color_cycling = not self.color_cycling
         elif action == "speed_down":
@@ -642,6 +704,9 @@ class MandelbrotViewer:
             self.cycle_speed = min(8.0, round(self.cycle_speed + 0.25, 2))
         elif action == "save":
             self.modal = "save"
+            self.modal_text = ""
+        elif action == "save_image":
+            self.modal = "save_image"
             self.modal_text = ""
         elif action == "load":
             self._refresh_saved_list()
@@ -668,6 +733,14 @@ class MandelbrotViewer:
         self.rotation = 0.0
         self._auto_iter()
         self.needs_compute = True
+
+    def _apply_aspect_ratio(self):
+        """Update render area to match the selected aspect ratio within the current window."""
+        self._update_render_area()
+        self.surface = pygame.Surface((self.render_w, self.render_h))
+        self._alloc_gpu_buffers()
+        self.needs_compute = True
+        self.save_res_idx = 0
 
     def _load_preset(self, preset_idx):
         """Load a preset location."""
@@ -750,6 +823,78 @@ class MandelbrotViewer:
         if not self.load_list:
             self.modal = None
 
+    # ── Save image ─────────────────────────────────────────────
+
+    def _save_image(self, name):
+        """Render the current view at the selected resolution and save as PNG."""
+        os.makedirs(IMAGES_DIR, exist_ok=True)
+        safe = "".join(c if c.isalnum() or c in " _-" else "_" for c in name).strip()
+        if not safe:
+            safe = "unnamed"
+        if not safe.lower().endswith(".png"):
+            safe += ".png"
+        filepath = os.path.join(IMAGES_DIR, safe)
+
+        aspect_name = ASPECT_RATIOS[self.aspect_id][0]
+        presets = RESOLUTION_PRESETS[aspect_name]
+        idx = min(self.save_res_idx, len(presets) - 1)
+        img_w, img_h = presets[idx]
+        img_buf = np.zeros((img_h, img_w, 3), dtype=np.uint8)
+        gpu_rgb_img = cuda.mem_alloc(img_buf.nbytes)
+        iter_bytes = img_w * img_h * np.dtype(np.float32).itemsize
+        gpu_iter_img = cuda.mem_alloc(iter_bytes)
+
+        grid_x = math.ceil(img_w / BLOCK_SIZE[0])
+        grid_y = math.ceil(img_h / BLOCK_SIZE[1])
+        grid = (grid_x, grid_y, 1)
+
+        rc = math.cos(self.rotation)
+        rs = math.sin(self.rotation)
+
+        if self.zoom >= DD_ZOOM_THRESHOLD:
+            cx_hi, cx_lo = self._split_double(self.center_x)
+            cy_hi, cy_lo = self._split_double(self.center_y)
+            self.k_compute_deep(
+                gpu_iter_img,
+                np.int32(img_w), np.int32(img_h),
+                np.float64(cx_hi), np.float64(cx_lo),
+                np.float64(cy_hi), np.float64(cy_lo),
+                np.float64(self.zoom),
+                np.int32(self.max_iter),
+                np.int32(self.fractal_type),
+                np.float64(rc), np.float64(rs),
+                block=BLOCK_SIZE, grid=grid,
+            )
+        else:
+            self.k_compute_fast(
+                gpu_iter_img,
+                np.int32(img_w), np.int32(img_h),
+                np.float64(float(self.center_x)),
+                np.float64(float(self.center_y)),
+                np.float64(self.zoom),
+                np.int32(self.max_iter),
+                np.int32(self.fractal_type),
+                np.float64(rc), np.float64(rs),
+                block=BLOCK_SIZE, grid=grid,
+            )
+
+        self.k_colorize(
+            gpu_rgb_img,
+            gpu_iter_img,
+            np.int32(img_w), np.int32(img_h),
+            np.float64(self.color_offset),
+            np.int32(self.palette_id),
+            block=BLOCK_SIZE, grid=grid,
+        )
+
+        cuda.memcpy_dtoh(img_buf, gpu_rgb_img)
+        img_surface = pygame.Surface((img_w, img_h))
+        pygame.surfarray.blit_array(img_surface, np.transpose(img_buf, (1, 0, 2)))
+        pygame.image.save(img_surface, filepath)
+
+        gpu_rgb_img.free()
+        gpu_iter_img.free()
+
     # ── Core helpers ──────────────────────────────────────────
 
     @staticmethod
@@ -759,10 +904,12 @@ class MandelbrotViewer:
         return hi, lo
 
     def _pixel_to_fractal(self, px, py):
-        aspect = Decimal(self.width) / Decimal(self.height)
+        rx = px - self.render_x
+        ry = py - self.render_y
+        aspect = Decimal(self.render_w) / Decimal(self.render_h)
         zoom_d = Decimal(self.zoom)
-        raw_x = (Decimal(px) / Decimal(self.width) - Decimal("0.5")) * aspect / zoom_d
-        raw_y = (Decimal(py) / Decimal(self.height) - Decimal("0.5")) / zoom_d
+        raw_x = (Decimal(rx) / Decimal(self.render_w) - Decimal("0.5")) * aspect / zoom_d
+        raw_y = (Decimal(ry) / Decimal(self.render_h) - Decimal("0.5")) / zoom_d
         rc = Decimal(math.cos(self.rotation))
         rs = Decimal(math.sin(self.rotation))
         fx = self.center_x + raw_x * rc - raw_y * rs
@@ -779,8 +926,8 @@ class MandelbrotViewer:
 
     def _run_compute(self):
         """Pass 1: run the expensive iteration kernel, cache results in gpu_iter."""
-        grid_x = math.ceil(self.width / BLOCK_SIZE[0])
-        grid_y = math.ceil(self.height / BLOCK_SIZE[1])
+        grid_x = math.ceil(self.render_w / BLOCK_SIZE[0])
+        grid_y = math.ceil(self.render_h / BLOCK_SIZE[1])
         grid = (grid_x, grid_y, 1)
 
         rc = math.cos(self.rotation)
@@ -791,7 +938,7 @@ class MandelbrotViewer:
             cy_hi, cy_lo = self._split_double(self.center_y)
             self.k_compute_deep(
                 self.gpu_iter,
-                np.int32(self.width), np.int32(self.height),
+                np.int32(self.render_w), np.int32(self.render_h),
                 np.float64(cx_hi), np.float64(cx_lo),
                 np.float64(cy_hi), np.float64(cy_lo),
                 np.float64(self.zoom),
@@ -803,7 +950,7 @@ class MandelbrotViewer:
         else:
             self.k_compute_fast(
                 self.gpu_iter,
-                np.int32(self.width), np.int32(self.height),
+                np.int32(self.render_w), np.int32(self.render_h),
                 np.float64(float(self.center_x)),
                 np.float64(float(self.center_y)),
                 np.float64(self.zoom),
@@ -815,14 +962,14 @@ class MandelbrotViewer:
 
     def _run_colorize(self):
         """Pass 2: cheap palette lookup from cached iteration buffer."""
-        grid_x = math.ceil(self.width / BLOCK_SIZE[0])
-        grid_y = math.ceil(self.height / BLOCK_SIZE[1])
+        grid_x = math.ceil(self.render_w / BLOCK_SIZE[0])
+        grid_y = math.ceil(self.render_h / BLOCK_SIZE[1])
         grid = (grid_x, grid_y, 1)
 
         self.k_colorize(
             self.gpu_rgb,
             self.gpu_iter,
-            np.int32(self.width), np.int32(self.height),
+            np.int32(self.render_w), np.int32(self.render_h),
             np.float64(self.color_offset),
             np.int32(self.palette_id),
             block=BLOCK_SIZE, grid=grid,
@@ -917,8 +1064,15 @@ class MandelbrotViewer:
         self.screen.blit(self.font.render(PALETTE_NAMES[self.palette_id], True, COL_ACCENT),
                          (panel_x + PANEL_PAD, self._palette_label_y))
 
-        # Section: COLOR CYCLE
+        # Section: ASPECT RATIO
         sec_y = self.buttons[8][0].y - 18
+        self.screen.blit(self.font_head.render("ASPECT", True, COL_HEADING), (panel_x + PANEL_PAD, sec_y))
+        aspect_name = ASPECT_RATIOS[self.aspect_id][0]
+        self.screen.blit(self.font.render(aspect_name, True, COL_ACCENT),
+                         (panel_x + PANEL_PAD, self._aspect_label_y))
+
+        # Section: COLOR CYCLE
+        sec_y = self.buttons[10][0].y - 18
         self.screen.blit(self.font_head.render("COLOR CYCLE", True, COL_HEADING), (panel_x + PANEL_PAD, sec_y))
         state = "ON" if self.color_cycling else "OFF"
         self.screen.blit(self.font.render(f"Cycling: {state}", True, COL_TEXT),
@@ -927,7 +1081,7 @@ class MandelbrotViewer:
                          (panel_x + PANEL_PAD, self._speed_label_y))
 
         # Section: SAVE / LOAD
-        sec_y = self.buttons[11][0].y - 18
+        sec_y = self.buttons[13][0].y - 18
         self.screen.blit(self.font_head.render("SAVE / LOAD", True, COL_HEADING), (panel_x + PANEL_PAD, sec_y))
 
         # Draw buttons
@@ -961,6 +1115,8 @@ class MandelbrotViewer:
 
         if self.modal == "save":
             self._draw_save_dialog()
+        elif self.modal == "save_image":
+            self._draw_save_image_dialog()
         elif self.modal == "load":
             self._draw_load_dialog()
 
@@ -987,6 +1143,65 @@ class MandelbrotViewer:
         cursor = "|" if int(time.time() * 2) % 2 == 0 else ""
         self.screen.blit(self.font.render(display_text + cursor, True, (255, 255, 255)),
                          (input_rect.x + 6, input_rect.y + 7))
+
+        self.screen.blit(self.font.render("[Esc] Cancel", True, (120, 120, 140)),
+                         (dx + 12, dy + dh - 22))
+
+    def _draw_save_image_dialog(self):
+        dw, dh = 400, 200
+        dx = (self.width - dw) // 2
+        dy = (self.height - dh) // 2
+        box = pygame.Surface((dw, dh), pygame.SRCALPHA)
+        box.fill((30, 30, 45, 240))
+        self.screen.blit(box, (dx, dy))
+        pygame.draw.rect(self.screen, COL_ACCENT, (dx, dy, dw, dh), 1, border_radius=6)
+
+        self.screen.blit(self.font_head.render("Save Image", True, COL_ACCENT),
+                         (dx + 12, dy + 12))
+        self.screen.blit(self.font.render("Enter filename and press Enter:", True, COL_TEXT),
+                         (dx + 12, dy + 34))
+
+        # Filename input
+        input_rect = pygame.Rect(dx + 12, dy + 56, dw - 24, 28)
+        pygame.draw.rect(self.screen, (50, 50, 70), input_rect, border_radius=3)
+        pygame.draw.rect(self.screen, COL_ACCENT, input_rect, 1, border_radius=3)
+
+        display_text = self.modal_text
+        cursor = "|" if int(time.time() * 2) % 2 == 0 else ""
+        self.screen.blit(self.font.render(display_text + cursor, True, (255, 255, 255)),
+                         (input_rect.x + 6, input_rect.y + 7))
+
+        # Resolution selector
+        res_y = dy + 96
+        self.screen.blit(self.font.render("Resolution:", True, COL_TEXT), (dx + 12, res_y))
+
+        aspect_name = ASPECT_RATIOS[self.aspect_id][0]
+        presets = RESOLUTION_PRESETS[aspect_name]
+        self.save_res_idx = min(self.save_res_idx, len(presets) - 1)
+        rw, rh = presets[self.save_res_idx]
+        res_label = f"{rw} x {rh}"
+
+        # < > buttons for resolution
+        btn_w = 28
+        btn_h = 24
+        left_x = dx + 12
+        right_x = dx + 12 + btn_w + 6
+        btn_y = res_y + 20
+
+        self._save_res_left_rect = pygame.Rect(left_x, btn_y, btn_w, btn_h)
+        self._save_res_right_rect = pygame.Rect(right_x, btn_y, btn_w, btn_h)
+
+        mx, my = pygame.mouse.get_pos()
+        for rect, label in [(self._save_res_left_rect, "<"), (self._save_res_right_rect, ">")]:
+            col = COL_BTN_HOVER if rect.collidepoint(mx, my) else COL_BTN
+            pygame.draw.rect(self.screen, col, rect, border_radius=3)
+            pygame.draw.rect(self.screen, (80, 80, 100), rect, 1, border_radius=3)
+            txt = self.font.render(label, True, COL_TEXT)
+            self.screen.blit(txt, (rect.x + (rect.w - txt.get_width()) // 2,
+                                   rect.y + (rect.h - txt.get_height()) // 2))
+
+        self.screen.blit(self.font.render(res_label, True, COL_ACCENT),
+                         (right_x + btn_w + 10, btn_y + 4))
 
         self.screen.blit(self.font.render("[Esc] Cancel", True, (120, 120, 140)),
                          (dx + 12, dy + dh - 22))
@@ -1066,6 +1281,9 @@ class MandelbrotViewer:
             if self.modal == "save":
                 self._handle_save_modal_event(event)
                 continue
+            if self.modal == "save_image":
+                self._handle_save_image_modal_event(event)
+                continue
             if self.modal == "load":
                 self._handle_load_modal_event(event)
                 continue
@@ -1131,6 +1349,33 @@ class MandelbrotViewer:
                 if ch and ch.isprintable() and len(self.modal_text) < 40:
                     self.modal_text += ch
 
+    def _handle_save_image_modal_event(self, event):
+        aspect_name = ASPECT_RATIOS[self.aspect_id][0]
+        num_presets = len(RESOLUTION_PRESETS[aspect_name])
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                self.modal = None
+            elif event.key == pygame.K_RETURN:
+                name = self.modal_text.strip()
+                if name:
+                    self._save_image(name)
+                self.modal = None
+            elif event.key == pygame.K_LEFT:
+                self.save_res_idx = (self.save_res_idx - 1) % num_presets
+            elif event.key == pygame.K_RIGHT:
+                self.save_res_idx = (self.save_res_idx + 1) % num_presets
+            elif event.key == pygame.K_BACKSPACE:
+                self.modal_text = self.modal_text[:-1]
+            else:
+                ch = event.unicode
+                if ch and ch.isprintable() and len(self.modal_text) < 40:
+                    self.modal_text += ch
+        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if hasattr(self, '_save_res_left_rect') and self._save_res_left_rect.collidepoint(event.pos):
+                self.save_res_idx = (self.save_res_idx - 1) % num_presets
+            elif hasattr(self, '_save_res_right_rect') and self._save_res_right_rect.collidepoint(event.pos):
+                self.save_res_idx = (self.save_res_idx + 1) % num_presets
+
     def _handle_load_modal_event(self, event):
         ROW_H = 30
         MAX_VISIBLE = 10
@@ -1185,11 +1430,11 @@ class MandelbrotViewer:
         elif event.key == pygame.K_c:
             self.color_cycling = not self.color_cycling
         elif event.key == pygame.K_UP:
-            self.iter_offset += 50
+            self.iter_offset += 100
             self._auto_iter()
             self.needs_compute = True
         elif event.key == pygame.K_DOWN:
-            self.iter_offset -= 50
+            self.iter_offset -= 100
             self._auto_iter()
             self.needs_compute = True
         elif event.key == pygame.K_LEFT:
@@ -1215,16 +1460,18 @@ class MandelbrotViewer:
                 self.modal = "load"
                 self.load_scroll = 0
                 self.load_hover = -1
+        elif event.key == pygame.K_a:
+            self._do_action("aspect_next")
         elif event.key == pygame.K_r:
             self._do_action("reset")
 
     def _handle_drag(self, pos):
         dx = pos[0] - self.drag_start[0]
         dy = pos[1] - self.drag_start[1]
-        aspect = Decimal(self.width) / Decimal(self.height)
+        aspect = Decimal(self.render_w) / Decimal(self.render_h)
         zoom_d = Decimal(self.zoom)
-        raw_x = Decimal(dx) / Decimal(self.width) * aspect / zoom_d
-        raw_y = Decimal(dy) / Decimal(self.height) / zoom_d
+        raw_x = Decimal(dx) / Decimal(self.render_w) * aspect / zoom_d
+        raw_y = Decimal(dy) / Decimal(self.render_h) / zoom_d
         rc = Decimal(math.cos(self.rotation))
         rs = Decimal(math.sin(self.rotation))
         self.center_x = self.drag_center_start[0] - (raw_x * rc - raw_y * rs)
@@ -1289,7 +1536,8 @@ class MandelbrotViewer:
         self.screen = pygame.display.set_mode(
             (self.width, self.height), pygame.RESIZABLE
         )
-        self.surface = pygame.Surface((self.width, self.height))
+        self._update_render_area()
+        self.surface = pygame.Surface((self.render_w, self.render_h))
         self._alloc_gpu_buffers()
         self._build_buttons()
         self.needs_compute = True
@@ -1318,7 +1566,8 @@ class MandelbrotViewer:
                 if self.needs_compute or self.needs_colorize:
                     self.render()
 
-                self.screen.blit(self.surface, (0, 0))
+                self.screen.fill((0, 0, 0))
+                self.screen.blit(self.surface, (self.render_x, self.render_y))
                 self.draw_overlay()
                 self.draw_panel()
                 self.draw_modal()
